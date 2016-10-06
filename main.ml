@@ -1,15 +1,15 @@
 open Lwt.Infix ;;
 open Extensions ;;
 
+module Yj = Yojson.Safe ;;
+
 let return_unit = Lwt.return_unit;;
 let return = Lwt.return;;
 
-type json_t = Yojson.Safe.json ;;
 type length_status = LengthOk of int | LengthError ;;
-type json_status = JsonOk of json_t | JsonError of string ;;
-type api = ApiUpdate of json_t | ApiQuery of json_t | ApiError ;;
-type query = 
-  QueryAll | QueryLocation of string | QueryUser of string | QueryError ;;
+type json_status = JsonOk of Yj.json | JsonError of string ;;
+type api = ApiUpdate of Yj.json | ApiQuery of Yj.json | ApiError ;;
+type query = QueryAll | QueryLocation of string | QueryUser of string | QueryError ;;
 
 type api_update_t = 
   { user : string ;
@@ -22,8 +22,10 @@ let spf = Printf.sprintf ;;
 let max_upload_len = 10*1024 ;; (*10KB*)
 let sql_table_name = "user_locations" ;;
 let username_max_length = 32 ;;
-let sleepy_loop_delay = 10.0 ;;
+let sleepy_loop_delay = 220.0 ;;
 let stale_db_entry_time = Int64.of_int (60*6) ;; (*20 minutes*)
+
+let location_config = Location.config_of_file "json/locations1.json" ;;
 
 let db =
   Sqlite3.db_open ~mode:`NO_CREATE ~mutex:`FULL "db/sampledb.sqlite" ;;
@@ -36,8 +38,6 @@ let sql_reset_db_stmt = Sqlite3.prepare db "DELETE FROM user_locations;" ;;
 let sql_query_all_stmt = Sqlite3.prepare db "SELECT * FROM user_locations;" ;;
 let sql_query_user_stmt = Sqlite3.prepare db "SELECT * FROM user_locations WHERE (username = ?001);" ;;
 let sql_query_location_stmt = Sqlite3.prepare db "SELECT * FROM user_locations WHERE (location = ?001);" ;;
-
-let locate_config = Location.config_of_path "json/locations.json" ;;
 
 (* Note: DON'T RUN IN OWN THREAD!!! *)
 let sqlite_stmt_exec stmt = 
@@ -84,7 +84,7 @@ let fini msg io =
  >>= (fun () -> Lwt_io.close inch) ;;
 
 let update_of_json json =
-  let open Yojson.Safe.Util in
+  let open Yj.Util in
   try
     match json with 
       | `Assoc json_l ->
@@ -109,9 +109,8 @@ let verify_request_length len =
         else LengthOk len end ;;
 
 let verify_json str = 
-  let open Yojson in
   return begin
-    try (JsonOk (Safe.from_string str))
+    try (JsonOk (Yj.from_string str))
     with Yojson.Json_error msg -> JsonError msg
   end ;;
 
@@ -130,7 +129,7 @@ let query_of_json = function
 let write_update_to_db u = 
   let open Sqlite3.Data in
   let now = Unix.time_int64 () in
-  let location_name = Location.title_of_latlon (u.lat,u.lon) in
+  let location_name = Location.title_of_latlon (u.lat,u.lon) location_config.gpsl in
   let bindings = 
   [ (1, (TEXT u.user)) ;
     (2, (TEXT location_name)) ;
@@ -154,7 +153,7 @@ let sanitize_update_data (d : api_update_t) =
   then raise @@ Update_error "Username too long"
   else { d with user = sanitize_username d.user } ;;
 
-let json_of_db_query bindings stmt : (Yojson.Safe.json) = 
+let json_of_db_query bindings stmt : (Yj.json) = 
   let rec json_of_row row = 
     let to_string = Sqlite3.Data.to_string in
     let username = `String (to_string @@ Array.get row 0) in
@@ -172,7 +171,6 @@ let json_of_db_query bindings stmt : (Yojson.Safe.json) =
   Sqlite3.reset stmt;
   data
 ;;
-
 
 (* Revelation: step increments what row we are on in the current query, and the
  * column, row_data functions allow us to retrieve data from the current row...
@@ -255,7 +253,7 @@ let main () =
   let listen_addr = Unix.ADDR_INET (Unix.inet_addr_any, port) in
   let start_server = (fun io -> Lwt.async (fun () -> server_main io)) in
 
-  Lwt_io.print @@ Location.string_of_locations ()
+  Lwt_io.print @@ Location.string_of_location_conf location_config
   >>= (fun () -> Lwt_io.printf "Started server on port %d\n" port)
   >|= (fun () -> sqlite_stmt_exec sql_reset_db_stmt)
   >>= (fun () ->
