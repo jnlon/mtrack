@@ -7,6 +7,7 @@
  * *)
 
 module Yj = Yojson.Safe ;;
+open Extensions;;
 
 type gps_coord = 
   { lat : float; 
@@ -49,7 +50,7 @@ let string_of_location_conf (loc_cfg : location_config) =
   let string_of_gps_location gpsl =
     let sw,ne = gpsl.sw,gpsl.ne in
     sprintf
-      "GPS Location: %s: (sw = (lat:%f,lon:%f), ne = (lat:%f,lon:%f), area = %f)\n"
+      "GPS Location %s:\n    sw = (%f,%f), ne = (%f,%f), area = %f\n\n"
       gpsl.name sw.lat sw.lon ne.lat ne.lon gpsl.area 
   in
   let aps_string_l,gps_string_l =
@@ -128,6 +129,47 @@ let title_of_gps gps (gpscfg : gps_location list) =
     smallest_location.name
   with _ -> "Unknown" ;;
 
+
+(* When Given the user's surrounding APs, return the location with the most
+ * matching APs compared to the user's *)
+let title_of_aps (aps : access_point list) (apscfg : ap_location list) =
+
+  let points_of_location loc = 
+    let points = 
+      List.fold_left
+      begin fun sum usrap ->
+        sum + (List.count usrap loc.aps)
+      end 0 aps
+    in
+    (loc.name, points)
+  in
+
+  let points = 
+    List.map points_of_location apscfg 
+  in
+
+  let cmpfun a b =
+    if (snd a) < (snd b)
+    then 1
+    else -1
+  in
+
+  fst @@ List.hd @@ List.sort cmpfun points
+;;
+
 let title_of_latlon (latlon : (float * float)) gpscfg =
   let lat,lon = latlon in
   title_of_gps {lat=lat;lon=lon} gpscfg ;;
+
+let title_of_netids (netids : (string * string) list) gpscfg =
+  let aps = List.map (fun n -> {ssid=(fst n);bssid=(snd n)}) netids in
+  title_of_aps aps gpscfg ;;
+
+let sample_run () = 
+  let location_config = config_of_file "json/locations.json" in
+  (*print_endline @@ string_of_location_conf location_config;*)
+  (*print_endline @@ title_of_netids [("eduroam", "04:da:d2:4f:36:ae")] location_config.apl*)
+  print_endline @@ title_of_aps [{ssid="MacSecure"; bssid="ac:a0:16:bb:16:20"}] location_config.apl
+;;
+
+sample_run () ;;
