@@ -1,6 +1,15 @@
-all:
-	ocamlbuild -use-ocamlfind -r -cflag -g -pkgs ssl,lwt.unix,lwt,sqlite3,yojson main.native
-location:
-	ocamlbuild -use-ocamlfind -r -pkgs yojson location.native
+SOURCES := main.ml location.ml
+OUT := main.native
+#OUT := location.native
+
+PKGS := ssl,lwt.unix,lwt,sqlite3,yojson
+OFLAGS := -r -cflag -g 
+
+$(OUT) : $(SOURCES)
+	ocamlbuild $(OFLAGS) -use-ocamlfind -pkgs $(PKGS) $(OUT)
+
 clean:
 	ocamlbuild -clean
+
+run : $(OUT)
+	./$(OUT)
