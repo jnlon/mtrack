@@ -21,6 +21,23 @@ module String = struct
 
 end;;
 
+module List = struct
+  include List
+
+  let count item lst =
+    let rec count i = function
+      | hd :: rest when hd = item -> count (i + 1) rest
+      | hd :: rest -> count i rest
+      | [] -> i
+    in
+    count 0 lst ;;
+
+  let sum intlst = 
+    List.fold_left (fun sum n -> sum + n) 0 intlst 
+  ;;
+
+end;;
+
 
 module Unix = struct
   include Unix
