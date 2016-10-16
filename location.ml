@@ -110,6 +110,10 @@ let locations_of_json = function
 let config_of_file path = 
   locations_of_json @@ Yj.from_file path ;;
 
+(* When given the gps coordinates of the user, compare it to the list of
+ * pre-configured locations. Once we find a list of locations that we fit
+ * inside (since gps location boundaries can overlap), return the location by
+ * with the smallest area *) 
 let title_of_gps gps (gpscfg : gps_location list) =
   let in_location_bounds c =
     let ulat,ulon = gps.lat,gps.lon in
@@ -119,21 +123,19 @@ let title_of_gps gps (gpscfg : gps_location list) =
       then true
       else false
   in
-  let locations = List.filter in_location_bounds gpscfg 
+  let possible_locations = List.filter in_location_bounds gpscfg 
   in
   let cmpfun a b =    
     if (a.area < b.area) then -1 else 1 
   in
   try
-    let smallest_location = List.hd @@ List.sort cmpfun gpscfg in
+    let smallest_location = List.hd @@ List.sort cmpfun possible_locations in
     smallest_location.name
   with _ -> "Unknown" ;;
-
 
 (* When Given the user's surrounding APs, return the location with the most
  * matching APs compared to the user's *)
 let title_of_aps (aps : access_point list) (apscfg : ap_location list) =
-
   let points_of_location loc = 
     let points = 
       List.fold_left
@@ -143,11 +145,9 @@ let title_of_aps (aps : access_point list) (apscfg : ap_location list) =
     in
     (loc.name, points)
   in
-
   let points = 
     List.map points_of_location apscfg 
   in
-
   let cmpfun a b =
     if (snd a) < (snd b)
     then 1

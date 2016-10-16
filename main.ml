@@ -19,9 +19,8 @@ type api_update =
   { user : string ;
     data : update_data } ;;
 
-type api = ApiUpdate of Yj.json | ApiQuery of Yj.json | ApiError of string ;;
+type api = ApiUpdate of Yj.json | ApiQuery of Yj.json ;;
 type query = QueryAll | QueryLocation of string | QueryUser of string ;;
-type update = Update of api_update | UpdateError of string ;;
 exception Api_err of string ;;
 
 (* Shorthands *)
@@ -179,12 +178,10 @@ let update_of_json (json : Yj.json) : api_update =
   let to_string = Yj.Util.to_string in
   let to_float = Yj.Util.to_float in
   let err msg = raise @@ Api_err msg in
-
   let gps_of_json json = 
     { lat = to_float @@ List.assoc "lat" json ;
       lon = to_float @@ List.assoc "lon" json } 
   in
-
   let ap_of_json = function
     | `Assoc ap 
       -> (try { ssid = to_string @@ List.assoc "ssid" ap ;
@@ -192,7 +189,6 @@ let update_of_json (json : Yj.json) : api_update =
           with Not_found -> err "bssid/ssid not found in ap_of_json")
     | _ -> err "Expected `Assoc in ap_of_json" 
   in
-
   (* Note: Match will not accept json unless username is first! *)
   match json with
     | `Assoc [("username", `String username); ("aps", `List ap_json_l)]
@@ -223,7 +219,6 @@ let query_of_json = function
   | _ -> raise @@ Api_err "Invalid query format" ;;
 
 let write_update_to_db (u : api_update) = 
-  let open Sqlite3.Data in
   let open Location in
   let time_now = Unix.time_int64 () in
   let location_name = 
@@ -276,25 +271,20 @@ let query_main io = function
       >>= Lwt_io.printl
 
 let update_main io json = 
-  return @@ update_of_json json
-  >|= verify_update_data
+  return @@ verify_update_data json
   >>= begin fun d -> 
     write_update_to_db d
     >|= (fun () -> string_of_update d)
     >>= Lwt_io.printl
   end ;;
 
-let api_main io req =
-  let open Location in
-  match req with
-    | ApiUpdate j -> 
-        update_main io j
-    | ApiQuery j -> 
-        return (query_of_json j)
-        >>= query_main io
-        >>= (fun () -> return_unit)
-    | ApiError msg -> 
-        Lwt_io.printf "ApiError: %s" msg ;;
+let api_main io = function
+  | ApiUpdate j -> 
+      return @@ update_of_json j
+      >>= update_main io
+  | ApiQuery j -> 
+      return @@ query_of_json j
+      >>= query_main io ;;
 
 let server_main io =
   let in_chan,out_chan = io in
