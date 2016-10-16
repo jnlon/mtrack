@@ -19,9 +19,8 @@ type api_update =
   { user : string ;
     data : update_data } ;;
 
-type length_status = LengthOk of int | LengthError ;;
 type api = ApiUpdate of Yj.json | ApiQuery of Yj.json | ApiError of string ;;
-type query = QueryAll | QueryLocation of string | QueryUser of string | QueryError of string ;;
+type query = QueryAll | QueryLocation of string | QueryUser of string ;;
 type update = Update of api_update | UpdateError of string ;;
 exception Api_err of string ;;
 
@@ -29,21 +28,24 @@ exception Api_err of string ;;
 let return_unit = Lwt.return_unit ;;
 let return = Lwt.return ;;
 let sprintf = Printf.sprintf ;;
+let printfl = Lwt_io.printf ;;
+let printl = Lwt_io.printl ;;
+let async = Lwt.async ;;
 
 (* Constants / Configuration paramaters *)
 module Const = struct
   let max_upload_len = 10*1024 ;; (*10KB*)
+  let max_username_length = 32 ;;
+  let db_max_query_rows = 50 ;;
+  let db_file_path = "db/sampledb.sqlite" ;;
   let sql_table_name = "user_locations" ;;
-  let username_max_length = 32 ;;
   let sleepy_loop_delay = 220.0 ;;
   let stale_db_entry_time = Int64.of_int (60*10) ;; (* in seconds *) 
-  let db_file_path = "db/sampledb.sqlite" ;;
   let location_config = 
     Location.config_of_file "json/locations.json" ;;
-  let backlog = 25 ;; (* Connections *)
-  let port = 9993 ;;
+  let backlog = 50 ;;
   let buffer_size = 20480 ;;
-  let db_max_query_rows = 50 ;;
+  let port = 9993 ;;
 end
 
 (* SQL definitions *)
@@ -58,7 +60,7 @@ module Sql = struct
 
   (* TODO: Define a separate module, and make these private through .mli *)
   let db =
-    Sqlite3.db_open ~mode:`NO_CREATE ~mutex:`FULL Const.db_file_path ;;
+    Sqlite3.db_open ~mode:`NO_CREATE ~mutex:`NO Const.db_file_path ;;
   let sql_insert_stmt = Sqlite3.prepare db 
     "INSERT INTO user_locations VALUES (?001, ?002, ?003);" ;;
   let sql_reset_db_stmt = Sqlite3.prepare db 
@@ -69,6 +71,8 @@ module Sql = struct
     "SELECT * FROM user_locations WHERE (username = ?001);" ;;
   let sql_query_location_stmt = Sqlite3.prepare db 
     "SELECT * FROM user_locations WHERE (location = ?001) ORDER BY last_update_time DESC;" ;;
+  let sql_delete_older_than_stmt time = Sqlite3.prepare db 
+    (sprintf "DELETE FROM user_locations WHERE (last_update_time <= %Ld);" time)
 
   let reset_stmt stmt =
     let open Sqlite3.Rc in
@@ -99,6 +103,11 @@ module Sql = struct
   let reset_db () = 
     reset_stmt sql_reset_db_stmt;
     sqlite_stmt_exec sql_reset_db_stmt ;;
+
+  let sqlite_bind_exec bindings stmt = 
+    reset_stmt stmt;
+    sqlite_bind bindings stmt;
+    sqlite_stmt_exec stmt ;;
 
   type db_entry = 
     { username : string ;
@@ -142,10 +151,8 @@ module Sql = struct
   let query_all () =
     query_users [] sql_query_all_stmt ;;
 
-  let sqlite_bind_exec bindings stmt = 
-    reset_stmt stmt;
-    sqlite_bind bindings stmt;
-    sqlite_stmt_exec stmt ;;
+  let delete_older_than time = 
+    sqlite_bind_exec [] (sql_delete_older_than_stmt time) ;;
 
   let update_user user place time =
     let bindings = 
@@ -153,11 +160,6 @@ module Sql = struct
       (2, (Sqlite3.Data.TEXT place)) ;
       (3, (Sqlite3.Data.INT time))] in
     sqlite_bind_exec bindings sql_insert_stmt ;;
-
-  let db_exec_log stmt = 
-    let code = Sqlite3.exec db stmt in 
-    let status = Sqlite3.Rc.to_string code in 
-    Lwt_io.printf "db_exec_log: %s (%s)\n" stmt status ;;
 
 end
 
@@ -169,9 +171,9 @@ let string_of_aps aps =
 let string_of_update r = 
   match r.data with
     | GPS g -> 
-        sprintf "GPS Update from '%s':\n  (%f,%f)\n" r.user g.lat g.lon
+        sprintf "GPS Update from '%s':\n  (%f,%f)" r.user g.lat g.lon
     | APS a ->
-        sprintf "APS Update from '%s':\n%s\n" r.user (string_of_aps a) ;;
+        sprintf "APS Update from '%s':\n%s" r.user (string_of_aps a) ;;
 
 let update_of_json (json : Yj.json) : api_update = 
   let to_string = Yj.Util.to_string in
@@ -203,25 +205,22 @@ let update_of_json (json : Yj.json) : api_update =
          with Not_found -> err "lat/lon not found in ap_of_json")
     | _ -> err "Invalid structure in Update json" ;;
 
-let print_api_update u = 
-  Lwt_io.print @@ string_of_update u ;;
-
 let verify_request_length len =
   if len > Const.max_upload_len 
-    then LengthError
-    else LengthOk len ;;
+    then raise @@ Api_err "Upload length exceeds maximum"
+    else len ;;
 
 let api_of_json = function
   | `Assoc [("Update", json)] -> ApiUpdate json
   | `Assoc [("Query", json)] -> ApiQuery json
-  | `Assoc [(c, _)] -> ApiError ("Unknown command: " ^ c)
-  |  _ -> ApiError "Invalid json format" ;;
+  | `Assoc [(c, _)] -> raise @@ Api_err (sprintf "Unknown API command '%s'" c)
+  |  _ -> raise @@ Api_err "Invalid API format" ;;
 
 let query_of_json = function
   | `String "all" -> QueryAll
   | `Assoc [("location", `String place)] -> QueryLocation place
   | `Assoc [("username", `String name)] -> QueryUser name
-  | _ -> QueryError "Invalid query" ;;
+  | _ -> raise @@ Api_err "Invalid query format" ;;
 
 let write_update_to_db (u : api_update) = 
   let open Sqlite3.Data in
@@ -237,20 +236,18 @@ let write_update_to_db (u : api_update) =
   Sql.update_user u.user location_name time_now;
   return_unit ;;
 
-let sanitize_username s =
-  let open String in
-  let sane_character = function
-    'a'..'z' | 'A'..'Z' | '0'..'9' -> true
-    | _ -> false 
-  in
-  unexplode @@ List.filter sane_character (explode s) ;;
-
 (* Usernames can only contain letters/numbers *)
-let sanitize_update_data (d : api_update) = 
-  if ((String.length d.user) > Const.username_max_length) 
-  then raise @@ Api_err "Username too long"
-  else { d with user = sanitize_username d.user } ;; (* TODO! Just error out when uname fails! *)
-
+let verify_update_data (d : api_update) = 
+  let uname_chars_ok s =
+    let sane_character = function
+      | 'a'..'z' | 'A'..'Z' | '0'..'9' -> true
+      | _ -> false in
+    List.for_all sane_character (String.explode s) in
+  let uname_length_ok = 
+    (String.length d.user) <= Const.max_username_length in
+  if (uname_length_ok && (uname_chars_ok d.user))
+  then d
+  else raise @@ Api_err ("Username invalid: " ^ d.user ) ;;
 
 let json_of_db_query (ulq_l : Sql.db_entry list) =
   let open Sql in
@@ -277,11 +274,10 @@ let query_main io = function
       >|= json_of_db_query
       >|= Yojson.Safe.to_string
       >>= Lwt_io.printl
-  | _ -> return_unit ;;
 
 let update_main io json = 
   return @@ update_of_json json
-  >|= sanitize_update_data
+  >|= verify_update_data
   >>= begin fun d -> 
     write_update_to_db d
     >|= (fun () -> string_of_update d)
@@ -304,29 +300,18 @@ let server_main io =
   let in_chan,out_chan = io in
   let read_json ch len = Lwt_io.read ~count:len ch in
   let verify_json = Yj.from_string in
-    begin Lwt_io.BE.read_int in_chan
-      >|= verify_request_length 
-      >>= begin function 
-         | LengthError -> 
-             Lwt_io.printf "Length must be < %d\n" Const.max_upload_len
-         | LengthOk len -> 
-             begin
-               read_json in_chan len
-               >|= verify_json
-               >|= api_of_json 
-               >>= api_main io
-         end
-      end
-  end ;;
+  Lwt_io.BE.read_int in_chan
+  >|= verify_request_length 
+  >>= read_json in_chan
+  >|= verify_json
+  >|= api_of_json 
+  >>= api_main io ;;
 
 let background_tasks () = 
-  let remove_older_than = 
+  let too_old = 
     Int64.sub (Unix.time_int64 ()) Const.stale_db_entry_time in
-  let sql = sprintf
-    "DELETE FROM user_locations WHERE (last_update_time <= %Ld);" 
-    remove_older_than 
-  in
-  Sql.db_exec_log sql ;;
+  Lwt_io.printf "Removing older than %Ld\n" too_old
+  >|= (fun () -> Sql.delete_older_than too_old) ;;
 
 let rec sleepy_loop delay = 
   Lwt_unix.sleep delay
@@ -334,10 +319,9 @@ let rec sleepy_loop delay =
   >>= (fun () -> sleepy_loop delay) ;;
 
 let start_server io = 
-  let stop_server msg = 
+  let stop_server_log msg = 
     let in_chan,out_chan = io in
-    return_unit
-    (*Lwt_io.printl msg*)
+    Lwt_io.printl msg
     >>= (fun () -> Lwt_io.close in_chan) 
   in
 
@@ -345,14 +329,14 @@ let start_server io =
     Lwt.catch 
       (fun () -> 
         server_main io
-        >>= (fun () -> stop_server "Success!"))
+        >>= (fun () -> Lwt_io.close (fst io)))
       (function                    (* Where fatal errors are caught *)
         | Api_err s -> 
-            stop_server ("API Error: " ^ s)
+            stop_server_log ("API Error: " ^ s)
         | Yojson.Json_error msg -> 
-            stop_server (sprintf "Json_error: %s" msg)
+            stop_server_log (sprintf "Json_error: %s" msg)
         | Yj.Util.Type_error (msg,json) ->
-            stop_server (sprintf "Type_error: %s (json = %s)" msg (Yj.to_string json))
+            stop_server_log (sprintf "Type_error: %s (json = %s)" msg (Yj.to_string json))
         | e -> raise e)
   in
   Lwt.async start_server

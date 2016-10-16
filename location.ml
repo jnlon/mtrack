@@ -164,12 +164,3 @@ let title_of_latlon (latlon : (float * float)) gpscfg =
 let title_of_netids (netids : (string * string) list) gpscfg =
   let aps = List.map (fun n -> {ssid=(fst n);bssid=(snd n)}) netids in
   title_of_aps aps gpscfg ;;
-
-let sample_run () = 
-  let location_config = config_of_file "json/locations.json" in
-  (*print_endline @@ string_of_location_conf location_config;*)
-  (*print_endline @@ title_of_netids [("eduroam", "04:da:d2:4f:36:ae")] location_config.apl*)
-  print_endline @@ title_of_aps [{ssid="MacSecure"; bssid="ac:a0:16:bb:16:20"}] location_config.apl
-;;
-
-sample_run () ;;
