@@ -16,10 +16,14 @@ type update_data =
   | APS of ap_update_data list ;;
 
 type api_update = 
-  { user : string ;
+  { id : string ;
+    user : string ;
     data : update_data } ;;
 
-type api = ApiUpdate of Yj.json | ApiQuery of Yj.json ;;
+type create_data =
+  { user : string } ;;
+
+type api = Update of Yj.json | Query of Yj.json | Create of Yj.json ;;
 type query = QueryAll | QueryLocation of string | QueryUser of string ;;
 exception Api_err of string ;;
 
@@ -36,10 +40,12 @@ module Const = struct
   let max_upload_len = 10*1024 ;; (*10KB*)
   let max_username_length = 32 ;;
   let db_max_query_rows = 50 ;;
-  let db_file_path = "db/sampledb.sqlite" ;;
+  let db_file_path = "db/sampledbV2.sqlite" ;;
   let sql_table_name = "user_locations" ;;
   let sleepy_loop_delay = 220.0 ;;
+  let id_char_length = 8 ;;
   let stale_db_entry_time = Int64.of_int (60*10) ;; (* in seconds *) 
+  let block_uncreated_ids = false ;;    (* clients must have a user id to make requests *)
   let location_config = 
     Location.config_of_file "json/locations.json" ;;
   let backlog = 50 ;;
@@ -61,7 +67,9 @@ module Sql = struct
   let db =
     Sqlite3.db_open ~mode:`NO_CREATE ~mutex:`NO Const.db_file_path ;;
   let sql_insert_stmt = Sqlite3.prepare db 
-    "INSERT INTO user_locations VALUES (?001, ?002, ?003);" ;;
+    "INSERT INTO user_locations VALUES (?001, ?002, ?003, ?004);" ;;
+  let sql_query_id_stmt = Sqlite3.prepare db
+    "SELECT 1 FROM user_locations WHERE userid=?001"
   let sql_reset_db_stmt = Sqlite3.prepare db 
     "DELETE FROM user_locations;" ;;
   let sql_query_all_stmt = Sqlite3.prepare db 
@@ -109,15 +117,21 @@ module Sql = struct
     sqlite_stmt_exec stmt ;;
 
   type db_entry = 
+    { userid : string ;
+      username : string ;
+      location : string ;
+      last_update_time : int64 } ;;
+
+  type query_db_entry = 
     { username : string ;
       location : string ;
       last_update_time : int64 } ;;
 
-  let query_users bindings stmt : (db_entry list) = 
+  let query_users bindings stmt : (query_db_entry list) = 
     let db_entry_of_row row = 
-      { username = string_of_db_text @@ Array.get row 0 ;
-        location = string_of_db_text @@ Array.get row 1 ;
-        last_update_time = int64_of_db_int @@ Array.get row 2 }
+      { username = string_of_db_text @@ Array.get row 1 ;
+        location = string_of_db_text @@ Array.get row 2 ;
+        last_update_time = int64_of_db_int @@ Array.get row 3 }
     in
 
     let rec walk_rows i = 
@@ -141,6 +155,21 @@ module Sql = struct
     walk_rows 0
   ;; 
 
+  let user_id_exists id =
+    reset_stmt sql_query_id_stmt;
+    sqlite_bind [(1, Sqlite3.Data.TEXT id)] sql_query_id_stmt;
+    let results = 
+        (List.accumulate 
+          (fun () -> Sqlite3.step sql_query_id_stmt) 
+          (fun r -> List.mem r [Sqlite3.Rc.DONE])) 
+    in
+    let found_an_id = 
+      List.mem Sqlite3.Rc.ROW results
+    in
+    (*String.concat "\n" (List.map Sqlite3.Rc.to_string results)*)
+    found_an_id 
+  ;;
+
   let query_by_name uname =
     query_users [(1, Sqlite3.Data.TEXT uname)] sql_query_user_stmt ;;
 
@@ -153,11 +182,12 @@ module Sql = struct
   let delete_older_than time = 
     sqlite_bind_exec [] (sql_delete_older_than_stmt time) ;;
 
-  let update_user user place time =
+  let update_user id user place time =
     let bindings = 
-    [ (1, (Sqlite3.Data.TEXT user)) ;
-      (2, (Sqlite3.Data.TEXT place)) ;
-      (3, (Sqlite3.Data.INT time))] in
+    [ (1, (Sqlite3.Data.TEXT id)) ;
+      (2, (Sqlite3.Data.TEXT user)) ;
+      (3, (Sqlite3.Data.TEXT place)) ;
+      (4, (Sqlite3.Data.INT time))] in
     sqlite_bind_exec bindings sql_insert_stmt ;;
 
 end
@@ -170,36 +200,35 @@ let string_of_aps aps =
 let string_of_update r = 
   match r.data with
     | GPS g -> 
-        sprintf "GPS Update from '%s':\n  (%f,%f)" r.user g.lat g.lon
+        sprintf "GPS Update from '%s':\n  (%f,%f)" r.id g.lat g.lon
     | APS a ->
-        sprintf "APS Update from '%s':\n%s" r.user (string_of_aps a) ;;
+        sprintf "APS Update from '%s':\n%s" r.id (string_of_aps a) ;;
 
 let update_of_json (json : Yj.json) : api_update = 
   let to_string = Yj.Util.to_string in
   let to_float = Yj.Util.to_float in
-  let err msg = raise @@ Api_err msg in
   let gps_of_json json = 
-    { lat = to_float @@ List.assoc "lat" json ;
-      lon = to_float @@ List.assoc "lon" json } 
+    try { lat = to_float @@ List.assoc "lat" json ;
+          lon = to_float @@ List.assoc "lon" json } 
+    with Not_found -> raise @@ Api_err "lat/lon not found in GPS data"
   in
   let ap_of_json = function
     | `Assoc ap 
       -> (try { ssid = to_string @@ List.assoc "ssid" ap ;
                 bssid = to_string @@ List.assoc "bssid" ap }
-          with Not_found -> err "bssid/ssid not found in ap_of_json")
-    | _ -> err "Expected `Assoc in ap_of_json" 
+          with Not_found -> raise @@ Api_err  "bssid/ssid not found in AP data")
+    | _ -> raise @@ Api_err "Expected `Assoc in ap_of_json" 
   in
-  (* Note: Match will not accept json unless username is first! *)
   match json with
-    | `Assoc [("username", `String username); ("aps", `List ap_json_l)]
-      -> (try { user = username ;
-                data = (APS (List.map ap_of_json ap_json_l)) }
-         with Not_found -> err "ssid/bssid not found in ap_of_json")
-    | `Assoc [("username", `String username); ("gps", `Assoc json)]
-      -> (try { user = username ;
-                data = (GPS (gps_of_json json))}
-         with Not_found -> err "lat/lon not found in ap_of_json")
-    | _ -> err "Invalid structure in Update json" ;;
+    | `Assoc [("id", `String id); ("username", `String username); data_json]
+    | `Assoc [("username", `String username); ("id", `String id); data_json] 
+      -> (let data = 
+            match data_json with
+              | ("aps", `List ap_json_l) -> (APS (List.map ap_of_json ap_json_l))
+              | ("gps", `Assoc json) -> (GPS (gps_of_json json))
+              | _ -> raise @@ Api_err "Invalid data structure in update json" in
+          {id = id ; user = username ; data = data})
+    | _ -> raise @@ Api_err "Invalid data structure in update json" ;;
 
 let verify_request_length len =
   if len > Const.max_upload_len 
@@ -207,8 +236,9 @@ let verify_request_length len =
     else len ;;
 
 let api_of_json = function
-  | `Assoc [("Update", json)] -> ApiUpdate json
-  | `Assoc [("Query", json)] -> ApiQuery json
+  | `Assoc [("Update", json)] -> Update json
+  | `Assoc [("Query", json)] -> Query json
+  | `Assoc [("Create", json)] -> Create json
   | `Assoc [(c, _)] -> raise @@ Api_err (sprintf "Unknown API command '%s'" c)
   |  _ -> raise @@ Api_err "Invalid API format" ;;
 
@@ -228,7 +258,7 @@ let write_update_to_db (u : api_update) =
                   (List.map (fun (a : ap_update_data) -> (a.ssid,a.bssid)) a)
                   Const.location_config.apl in
 
-  Sql.update_user u.user location_name time_now;
+  Sql.update_user u.id u.user location_name time_now;
   return_unit ;;
 
 (* Usernames can only contain letters/numbers *)
@@ -244,7 +274,7 @@ let verify_update_data (d : api_update) =
   then d
   else raise @@ Api_err ("Username invalid: " ^ d.user ) ;;
 
-let json_of_db_query (ulq_l : Sql.db_entry list) =
+let json_of_db_query (ulq_l : Sql.query_db_entry list) =
   let open Sql in
   let json_of_ulq ulq = 
     `Assoc [("username", `String ulq.username);
@@ -252,6 +282,10 @@ let json_of_db_query (ulq_l : Sql.db_entry list) =
             ("lastupdate", `Intlit (Int64.to_string ulq.last_update_time))]
   in
   `Assoc [("QueryResponse", (`List (List.map json_of_ulq ulq_l)))] ;;
+
+let create_of_json = function
+  | `Assoc [("username", `String user)] -> {user=user} 
+  | _ -> raise @@ Api_err "Invalid Create json structure" ;;
 
 let query_main io = function
   | QueryUser name -> 
@@ -278,13 +312,36 @@ let update_main io json =
     >>= Lwt_io.printl
   end ;;
 
+let rec create_user_id () = 
+  let buf = Bytes.create Const.id_char_length in
+  let rec gen_id i = 
+    let ch = char_of_int (Random.int 127) in
+    match ch with
+      | _ when i = (Const.id_char_length) 
+          -> Bytes.to_string buf
+      | 'a'..'z' | 'A'..'Z' | '0'..'9' 
+          -> (Bytes.set buf i ch; gen_id (i + 1))
+      | _ -> gen_id i
+  in
+  let id = (gen_id 0) 
+  in
+  if Sql.user_id_exists id
+    then create_user_id ()
+    else id ;;
+
 let api_main io = function
-  | ApiUpdate j -> 
+  | Update j -> 
       return @@ update_of_json j
       >>= update_main io
-  | ApiQuery j -> 
+  | Query j -> 
       return @@ query_of_json j
-      >>= query_main io ;;
+      >>= query_main io 
+  | Create j -> 
+      return @@ create_of_json j
+      >>= begin fun cdata -> 
+        return @@ create_user_id ()
+        >>= Lwt_io.printl
+      end ;;
 
 let server_main io =
   let in_chan,out_chan = io in
@@ -309,7 +366,7 @@ let rec sleepy_loop delay =
   >>= (fun () -> sleepy_loop delay) ;;
 
 let start_server io = 
-  let stop_server_log msg = 
+  let log_stop_server msg = 
     let in_chan,out_chan = io in
     Lwt_io.printl msg
     >>= (fun () -> Lwt_io.close in_chan) 
@@ -322,11 +379,13 @@ let start_server io =
         >>= (fun () -> Lwt_io.close (fst io)))
       (function                    (* Where fatal errors are caught *)
         | Api_err s -> 
-            stop_server_log ("API Error: " ^ s)
+            log_stop_server ("API Error: " ^ s)
+        | Sqlite3.Error msg -> 
+            log_stop_server (sprintf "Sqlite3.Error: %s" msg)
         | Yojson.Json_error msg -> 
-            stop_server_log (sprintf "Json_error: %s" msg)
+            log_stop_server (sprintf "Json_error: %s" msg)
         | Yj.Util.Type_error (msg,json) ->
-            stop_server_log (sprintf "Type_error: %s (json = %s)" msg (Yj.to_string json))
+            log_stop_server (sprintf "Type_error: %s (json = %s)" msg (Yj.to_string json))
         | e -> raise e)
   in
   Lwt.async start_server
@@ -351,6 +410,6 @@ let main () =
     end ;
     sleepy_loop Const.sleepy_loop_delay) ;;
 
+Random.self_init ();
 Printexc.record_backtrace true ;;
-
 Lwt_main.run @@ main () ;;

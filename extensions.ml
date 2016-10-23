@@ -33,8 +33,16 @@ module List = struct
     count 0 lst ;;
 
   let sum intlst = 
-    List.fold_left (fun sum n -> sum + n) 0 intlst 
-  ;;
+    List.fold_left (fun sum n -> sum + n) 0 intlst ;;
+
+  let accumulate get end_if =
+    let rec acc lst = 
+      let result = get () in
+      if end_if result 
+        then result :: lst
+        else (result :: (acc (result :: lst)))
+    in
+    acc [] ;;
 
 end;;
 
