@@ -44,6 +44,10 @@ module List = struct
     in
     acc [] ;;
 
+  let rec repeat thing times =
+    if times = 0 then []
+    else thing :: (repeat thing (times-1)) ;;
+
 end;;
 
 
