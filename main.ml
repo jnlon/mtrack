@@ -25,6 +25,7 @@ type api_create =
 
 type api = Update of Yj.json | Query of Yj.json | Create of Yj.json ;;
 type query = QueryAll | QueryLocation of string | QueryUsers of string list ;;
+type create_response = CreateID of string | CreateError of string ;;
 exception Api_err of string ;;
 exception Constraint ;;
 
@@ -82,7 +83,7 @@ module Sql = struct
   let sql_create_user_stmt = Sqlite3.prepare db 
     "INSERT INTO 
     user_locations (userid,username,location,last_update_time,creation_time)
-    VALUES (?001, ?002, NULL, NULL, ?003);" ;;
+    VALUES (?001, ?002, '', ?003, ?004);" ;;
   let sql_query_id_stmt = Sqlite3.prepare db
     "SELECT * FROM user_locations WHERE userid=?001"
   let sql_reset_db_stmt = Sqlite3.prepare db 
@@ -209,7 +210,8 @@ module Sql = struct
     let bindings = 
     [ (1, (SD.TEXT id));
       (2, (SD.TEXT user));
-      (3, (SD.INT time))] in
+      (3, (SD.INT time));
+      (4, (SD.INT time))] in
     sqlite_bind_exec bindings sql_create_user_stmt 
 end
 
@@ -285,7 +287,7 @@ let write_update (u : api_update) =
 
 let write_create (d : api_create) (generated_id : string) = 
   Sql.create_user generated_id d.user (Unix.time_int64 ());
-  generated_id ;;
+  return_unit ;;
 
 (* Usernames can only contain letters/numbers *)
 let verify_update_data (d : api_update) = 
@@ -300,7 +302,7 @@ let verify_update_data (d : api_update) =
   then d
   else raise @@ Api_err ("Username invalid: " ^ d.user ) ;;
 
-let json_of_db_query (ulq_l : Sql.query_db_entry list) =
+let response_of_query (ulq_l : Sql.query_db_entry list) =
   let open Sql in
   let json_of_ulq ulq = 
     `Assoc [("username", `String ulq.username);
@@ -313,23 +315,15 @@ let create_of_json = function
   | `Assoc [("username", `String user)] -> {user=user} 
   | _ -> raise @@ Api_err "Invalid Create json structure" ;;
 
-let query_main io = function
-  | QueryUsers names -> 
-      return @@ Sql.query_by_names names
-      >|= json_of_db_query
-      >|= Yojson.Safe.to_string
-      >>= Lwt_io.printl
-  | QueryLocation place -> 
-      return @@ Sql.query_by_location place
-      >|= json_of_db_query
-      >|= Yojson.Safe.to_string
-      >>= Lwt_io.printl
-  | QueryAll -> 
-      return @@ Sql.query_all ()
-      >|= json_of_db_query
-      >|= Yojson.Safe.to_string
-      >>= Lwt_io.printl ;;
-
+let query_main io query = 
+  match query with
+    | QueryUsers names ->
+        Sql.query_by_names names
+    | QueryLocation place -> 
+        Sql.query_by_location place
+    | QueryAll -> 
+        Sql.query_all () ;;
+  
 let update_main io json = 
   return @@ verify_update_data json
   >>= begin fun d -> 
@@ -354,27 +348,59 @@ let rec create_user_id () =
     then create_user_id ()
     else id ;;
 
+
+let response_of_create response = 
+  let make_json inner = 
+    `Assoc [("CreateResponse", inner)] in
+  let inner_data = 
+    match response with
+      | CreateID id ->
+        `Assoc [("id", `String id)]
+      | CreateError err ->
+        `Assoc [("error", `String err)] in
+  make_json inner_data ;;
+
+
+let write_json_to_client io (response : Yj.json) =
+  let oc = (snd io) in
+  let data = Yj.to_string response in 
+  let len = Int32.of_int @@ String.length data in
+  Lwt_io.BE.write_int32 oc len
+  >>= (fun () -> Lwt_io.write oc data)
+  >>= (fun () -> Lwt_io.printf "OUT: %s (%ld)\n" data len)
+;;
+
 let api_main io = function
   | Update j -> 
       return @@ update_of_json j
       >>= update_main io
   | Query j -> 
       return @@ query_of_json j
-      >>= query_main io 
+      >|= query_main io 
+      >|= response_of_query
+      >>= write_json_to_client io
   | Create j -> 
       return @@ create_of_json j
       >>= begin fun d -> 
         return @@ create_user_id ()
-        >|= begin fun id ->
-          try (write_create d id) 
-          with Constraint -> (d.user ^ " already in DB")
+        >>= begin fun id ->
+          try 
+            ignore @@ write_create d id;
+            return @@ response_of_create (CreateID id)
+            >>= write_json_to_client io
+          with Constraint -> 
+            return @@ response_of_create (CreateError (d.user ^ " already exists"))
+            >>= write_json_to_client io
         end
-        >>= Lwt_io.printl
       end ;;
 
 let server_main io =
   let in_chan,out_chan = io in
-  let read_json ch len = Lwt_io.read ~count:len ch in
+  let read_json ch len = 
+    Lwt_io.read ~count:len ch
+    >>= (fun j -> Lwt_io.printf "IN:  %s\n" j 
+    >|= (fun () -> j))
+  in
   Lwt_io.BE.read_int in_chan
   >|= verify_request_length 
   >>= read_json in_chan
