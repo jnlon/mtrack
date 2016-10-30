@@ -20,12 +20,13 @@ type api_update =
     user : string ;
     data : update_data } ;;
 
-type create_data =
+type api_create =
   { user : string } ;;
 
 type api = Update of Yj.json | Query of Yj.json | Create of Yj.json ;;
 type query = QueryAll | QueryLocation of string | QueryUsers of string list ;;
 exception Api_err of string ;;
+exception Constraint ;;
 
 (* Shorthands *)
 let return_unit = Lwt.return_unit ;;
@@ -41,7 +42,7 @@ module Const = struct
   let max_upload_len = 10*1024 ;; (*10KB*)
   let max_username_length = 32 ;;
   let db_max_query_rows = 50 ;;
-  let db_file_path = "db/sampledbV2.sqlite" ;;
+  let db_file_path = "db/sampledbV3.sqlite" ;;
   let sql_table_name = "user_locations" ;;
   let sleepy_loop_delay = 220.0 ;;
   let id_char_length = 8 ;;
@@ -57,49 +58,67 @@ end
 (* SQL definitions *)
 module Sql = struct
 
+  module SD = Sqlite3.Data ;;
+  module S = Sqlite3 ;;
+
   exception Bad_conv of string
-  let int64_of_db_int = function Sqlite3.Data.INT i64 -> i64 | _ -> raise @@ Bad_conv "int64" ;;
-  let float_of_db_float = function Sqlite3.Data.FLOAT f -> f | _ -> raise @@ Bad_conv "float" ;;
-  let string_of_db_text = function Sqlite3.Data.TEXT txt -> txt | _ -> raise @@ Bad_conv "text" ;;
-  let string_of_db_blob = function Sqlite3.Data.BLOB blb -> blb | _ -> raise @@ Bad_conv "blob" ;;
+  let int64_of_db_int = function 
+    SD.INT i64 -> i64 
+    | SD.NULL -> 0L 
+    | _ -> raise @@ Bad_conv "int64" ;;
+  let float_of_db_float = function SD.FLOAT f -> f | _ -> raise @@ Bad_conv "float" ;;
+  let string_of_db_text = function 
+    SD.TEXT txt -> txt 
+  | SD.NULL -> "" 
+  | _ -> raise @@ Bad_conv "text" ;;
+  let string_of_db_blob = function SD.BLOB blb -> blb | _ -> raise @@ Bad_conv "blob" ;;
 
   (* TODO: Define a separate module, and make these private through .mli *)
   let db =
-    Sqlite3.db_open ~mode:`NO_CREATE ~mutex:`NO Const.db_file_path ;;
-  let sql_insert_stmt = Sqlite3.prepare db 
-    "INSERT INTO user_locations VALUES (?001, ?002, ?003, ?004);" ;;
+    Sqlite3.db_open ~mode:`NO_CREATE ~mutex:`FULL Const.db_file_path ;;
+  let sql_update_user_stmt = Sqlite3.prepare db 
+    "UPDATE user_locations SET location=?002, last_update_time=?003
+    WHERE userid=?001" ;;
+  let sql_create_user_stmt = Sqlite3.prepare db 
+    "INSERT INTO 
+    user_locations (userid,username,location,last_update_time,creation_time)
+    VALUES (?001, ?002, NULL, NULL, ?003);" ;;
   let sql_query_id_stmt = Sqlite3.prepare db
-    "SELECT 1 FROM user_locations WHERE userid=?001"
+    "SELECT * FROM user_locations WHERE userid=?001"
   let sql_reset_db_stmt = Sqlite3.prepare db 
     "DELETE FROM user_locations;" ;;
   let sql_query_all_stmt = Sqlite3.prepare db 
-    "SELECT * FROM user_locations ORDER BY last_update_time DESC;" ;;
+    "SELECT * FROM user_locations ORDER BY
+    last_update_time DESC;" ;;
   let sql_query_users_stmt n = 
     let identifiers = 
       String.concat ", " (List.repeat "?" n) in
     let stmtsrc = 
       Printf.sprintf 
         "SELECT * FROM user_locations WHERE username IN (%s);" identifiers in
+    print_one_off stmtsrc;
     Sqlite3.prepare db stmtsrc ;;
   let sql_query_location_stmt = Sqlite3.prepare db 
-    "SELECT * FROM user_locations WHERE (location = ?001) ORDER BY last_update_time DESC;" ;;
+    "SELECT * FROM user_locations WHERE (location = ?001)
+    ORDER BY last_update_time DESC;" ;;
   let sql_delete_older_than_stmt time = Sqlite3.prepare db 
     (sprintf "DELETE FROM user_locations WHERE (last_update_time <= %Ld);" time)
 
-  let reset_stmt stmt =
+  let rec reset_stmt stmt =
     let open Sqlite3.Rc in
     let cb = Sqlite3.clear_bindings stmt in
     let rst = Sqlite3.reset stmt in
     match cb,rst with
       | (OK,OK) -> ()
-      | _ -> raise @@ Sqlite3.Error "Could not reset stmt!" ;;
+      | _ -> reset_stmt stmt ;;
 
   let sqlite_stmt_exec stmt = 
     let open Sqlite3.Rc in
     let step () = Sqlite3.step stmt in
     let rec walk_sqlite = function
           | BUSY | OK -> walk_sqlite @@ step ()
-          | DONE -> ignore @@ Sqlite3.reset stmt
+          | DONE -> ()
+          | CONSTRAINT -> raise Constraint
           | state -> 
               raise @@ Sqlite3.Error (sprintf "Error in exec_sql_stmt: %s" (to_string state))
     in
@@ -128,60 +147,50 @@ module Sql = struct
       last_update_time : int64 } ;;
 
   type query_db_entry = 
-    { username : string ;
+    { userid : string ;
+      username : string ;
       location : string ;
-      last_update_time : int64 } ;;
+      last_update_time : int64 ;
+      creation_time : int64 } ;;
 
   let query_db bindings stmt : (query_db_entry list) = 
     let db_entry_of_row row = 
-      { username = string_of_db_text @@ Array.get row 1 ;
+      { userid = string_of_db_text @@ Array.get row 0 ;
+        username = string_of_db_text @@ Array.get row 1 ;
         location = string_of_db_text @@ Array.get row 2 ;
-        last_update_time = int64_of_db_int @@ Array.get row 3 }
+        last_update_time = int64_of_db_int @@ Array.get row 3 ;
+        creation_time = int64_of_db_int @@ Array.get row 4 ; }
     in
-
     let rec walk_rows i = 
       if i >= Const.db_max_query_rows then [] 
       else begin
         let open Sqlite3.Rc in
         match Sqlite3.step stmt with
             DONE -> []
-          | ROW | OK -> begin
+          | ROW -> begin
               let data = Sqlite3.row_data stmt in
-              if Array.length data > 0 
-              then (db_entry_of_row data) :: walk_rows (i + 1)
-              else walk_rows i
+              (db_entry_of_row data) :: walk_rows (i + 1)
           end
           | r -> walk_rows i
       end
     in
-
     reset_stmt stmt;
     sqlite_bind bindings stmt;
     walk_rows 0
   ;; 
 
   let user_id_exists id =
-    reset_stmt sql_query_id_stmt;
-    sqlite_bind [(1, Sqlite3.Data.TEXT id)] sql_query_id_stmt;
-    let results = 
-        (List.accumulate 
-          (fun () -> Sqlite3.step sql_query_id_stmt) 
-          (fun r -> List.mem r [Sqlite3.Rc.DONE])) 
-    in
-    let found_an_id = 
-      List.mem Sqlite3.Rc.ROW results
-    in
-    (*String.concat "\n" (List.map Sqlite3.Rc.to_string results)*)
-    found_an_id 
+    let query = query_db [1, (SD.TEXT id)] sql_query_id_stmt in
+    (List.length query) > 0
   ;;
 
   let query_by_names names =
     let stmt = sql_query_users_stmt (List.length names) in
-    let bindings = List.mapi (fun i name -> ((i+1), Sqlite3.Data.TEXT name)) names in
-    query_db bindings stmt  ;;
+    let bindings = List.mapi (fun i name -> ((i+1), SD.TEXT name)) names in
+    query_db bindings stmt ;;
 
   let query_by_location place =
-    query_db [(1, Sqlite3.Data.TEXT place)] sql_query_location_stmt ;;
+    query_db [(1, SD.TEXT place)] sql_query_location_stmt ;;
 
   let query_all () =
     query_db [] sql_query_all_stmt ;;
@@ -189,14 +198,19 @@ module Sql = struct
   let delete_older_than time = 
     sqlite_bind_exec [] (sql_delete_older_than_stmt time) ;;
 
-  let update_user id user place time =
+  let update_user id place time =
     let bindings = 
-    [ (1, (Sqlite3.Data.TEXT id)) ;
-      (2, (Sqlite3.Data.TEXT user)) ;
-      (3, (Sqlite3.Data.TEXT place)) ;
-      (4, (Sqlite3.Data.INT time))] in
-    sqlite_bind_exec bindings sql_insert_stmt ;;
+    [ (1, (SD.TEXT id));
+      (2, (SD.TEXT place));
+      (3, (SD.INT time))] in
+    sqlite_bind_exec bindings sql_update_user_stmt ;;
 
+  let create_user id user time = 
+    let bindings = 
+    [ (1, (SD.TEXT id));
+      (2, (SD.TEXT user));
+      (3, (SD.INT time))] in
+    sqlite_bind_exec bindings sql_create_user_stmt 
 end
 
 let string_of_aps aps =
@@ -256,7 +270,7 @@ let query_of_json = function
       QueryUsers (List.map Yj.Util.to_string names)
   | _ -> raise @@ Api_err "Invalid query format" ;;
 
-let write_update_to_db (u : api_update) = 
+let write_update (u : api_update) = 
   let open Location in
   let time_now = Unix.time_int64 () in
   let location_name = 
@@ -266,8 +280,12 @@ let write_update_to_db (u : api_update) =
                   (List.map (fun (a : ap_update_data) -> (a.ssid,a.bssid)) a)
                   Const.location_config.apl in
 
-  Sql.update_user u.id u.user location_name time_now;
+  Sql.update_user u.id location_name time_now;
   return_unit ;;
+
+let write_create (d : api_create) (generated_id : string) = 
+  Sql.create_user generated_id d.user (Unix.time_int64 ());
+  generated_id ;;
 
 (* Usernames can only contain letters/numbers *)
 let verify_update_data (d : api_update) = 
@@ -315,7 +333,7 @@ let query_main io = function
 let update_main io json = 
   return @@ verify_update_data json
   >>= begin fun d -> 
-    write_update_to_db d
+    write_update d
     >|= (fun () -> string_of_update d)
     >>= Lwt_io.printl
   end ;;
@@ -331,8 +349,7 @@ let rec create_user_id () =
           -> (Bytes.set buf i ch; gen_id (i + 1))
       | _ -> gen_id i
   in
-  let id = (gen_id 0) 
-  in
+  let id = (gen_id 0) in
   if Sql.user_id_exists id
     then create_user_id ()
     else id ;;
@@ -346,19 +363,22 @@ let api_main io = function
       >>= query_main io 
   | Create j -> 
       return @@ create_of_json j
-      >>= begin fun cdata -> 
+      >>= begin fun d -> 
         return @@ create_user_id ()
+        >|= begin fun id ->
+          try (write_create d id) 
+          with Constraint -> (d.user ^ " already in DB")
+        end
         >>= Lwt_io.printl
       end ;;
 
 let server_main io =
   let in_chan,out_chan = io in
   let read_json ch len = Lwt_io.read ~count:len ch in
-  let verify_json = Yj.from_string in
   Lwt_io.BE.read_int in_chan
   >|= verify_request_length 
   >>= read_json in_chan
-  >|= verify_json
+  >|= Yj.from_string
   >|= api_of_json 
   >>= api_main io ;;
 
