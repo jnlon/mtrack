@@ -327,10 +327,13 @@ let query_main io query =
 let update_main io json = 
   return @@ verify_update_data json
   >>= begin fun d -> 
-    write_update d
-    >|= (fun () -> string_of_update d)
-    >>= Lwt_io.printl
-  end ;;
+    return (Sql.user_id_exists d.id)
+    >|= function
+        | true -> (ignore @@ write_update d; string_of_update d)
+        | false -> (sprintf "ID '%s' not found, no update written" d.id)
+  end
+  >>= Lwt_io.printl
+;;
 
 let rec create_user_id () = 
   let buf = Bytes.create Const.id_char_length in
