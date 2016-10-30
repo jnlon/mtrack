@@ -17,7 +17,6 @@ type update_data =
 
 type api_update = 
   { id : string ;
-    user : string ;
     data : update_data } ;;
 
 type api_create =
@@ -26,8 +25,10 @@ type api_create =
 type api = Update of Yj.json | Query of Yj.json | Create of Yj.json ;;
 type query = QueryAll | QueryLocation of string | QueryUsers of string list ;;
 type create_response = CreateID of string | CreateError of string ;;
-exception Api_err of string ;;
+exception CreateException of string ;;
+exception UpdateException of string ;;
 exception Constraint ;;
+exception Err of string ;;
 
 (* Shorthands *)
 let return_unit = Lwt.return_unit ;;
@@ -42,6 +43,7 @@ let print_one_off msg = async (fun () -> printl msg) ;;
 module Const = struct
   let max_upload_len = 10*1024 ;; (*10KB*)
   let max_username_length = 32 ;;
+  let min_username_length = 8 ;;
   let db_max_query_rows = 50 ;;
   let db_file_path = "db/sampledbV3.sqlite" ;;
   let sql_table_name = "user_locations" ;;
@@ -78,19 +80,16 @@ module Sql = struct
   let db =
     Sqlite3.db_open ~mode:`NO_CREATE ~mutex:`FULL Const.db_file_path ;;
   let sql_update_user_stmt = Sqlite3.prepare db 
-    "UPDATE user_locations SET location=?002, last_update_time=?003
-    WHERE userid=?001" ;;
+    "UPDATE user_locations SET location=?002, last_update_time=?003 WHERE userid=?001" ;;
   let sql_create_user_stmt = Sqlite3.prepare db 
-    "INSERT INTO 
-    user_locations (userid,username,location,last_update_time,creation_time)
-    VALUES (?001, ?002, '', ?003, ?004);" ;;
+    "INSERT INTO user_locations (userid,username,location,last_update_time,creation_time)
+     VALUES (?001, ?002, '', ?003, ?004);" ;;
   let sql_query_id_stmt = Sqlite3.prepare db
     "SELECT * FROM user_locations WHERE userid=?001"
   let sql_reset_db_stmt = Sqlite3.prepare db 
     "DELETE FROM user_locations;" ;;
   let sql_query_all_stmt = Sqlite3.prepare db 
-    "SELECT * FROM user_locations ORDER BY
-    last_update_time DESC;" ;;
+    "SELECT * FROM user_locations ORDER BY last_update_time DESC;" ;;
   let sql_query_users_stmt n = 
     let identifiers = 
       String.concat ", " (List.repeat "?" n) in
@@ -101,7 +100,7 @@ module Sql = struct
     Sqlite3.prepare db stmtsrc ;;
   let sql_query_location_stmt = Sqlite3.prepare db 
     "SELECT * FROM user_locations WHERE (location = ?001)
-    ORDER BY last_update_time DESC;" ;;
+     ORDER BY last_update_time DESC;" ;;
   let sql_delete_older_than_stmt time = Sqlite3.prepare db 
     (sprintf "DELETE FROM user_locations WHERE (last_update_time <= %Ld);" time)
 
@@ -140,12 +139,6 @@ module Sql = struct
     reset_stmt stmt;
     sqlite_bind bindings stmt;
     sqlite_stmt_exec stmt ;;
-
-  type db_entry = 
-    { userid : string ;
-      username : string ;
-      location : string ;
-      last_update_time : int64 } ;;
 
   type query_db_entry = 
     { userid : string ;
@@ -212,7 +205,10 @@ module Sql = struct
       (2, (SD.TEXT user));
       (3, (SD.INT time));
       (4, (SD.INT time))] in
-    sqlite_bind_exec bindings sql_create_user_stmt 
+    try
+      sqlite_bind_exec bindings sql_create_user_stmt 
+    with Constraint -> raise Constraint
+    
 end
 
 let string_of_aps aps =
@@ -223,9 +219,9 @@ let string_of_aps aps =
 let string_of_update r = 
   match r.data with
     | GPS g -> 
-        sprintf "GPS Update from id='%s',user='%s':\n  (%f,%f)" r.id r.user g.lat g.lon
+        sprintf "GPS Update from id='%s'\n  (%f,%f)" r.id g.lat g.lon
     | APS a ->
-        sprintf "APS Update from id='%s',user='%s':\n%s" r.id r.user (string_of_aps a) ;;
+        sprintf "APS Update from id='%s'\n%s" r.id (string_of_aps a) ;;
 
 let update_of_json (json : Yj.json) : api_update = 
   let to_string = Yj.Util.to_string in
@@ -233,44 +229,43 @@ let update_of_json (json : Yj.json) : api_update =
   let gps_of_json json = 
     try { lat = to_float @@ List.assoc "lat" json ;
           lon = to_float @@ List.assoc "lon" json } 
-    with Not_found -> raise @@ Api_err "lat/lon not found in GPS data"
+    with Not_found -> raise @@ Err "lat/lon not found in GPS data"
   in
   let ap_of_json = function
     | `Assoc ap 
       -> (try { ssid = to_string @@ List.assoc "ssid" ap ;
                 bssid = to_string @@ List.assoc "bssid" ap }
-          with Not_found -> raise @@ Api_err  "bssid/ssid not found in AP data")
-    | _ -> raise @@ Api_err "Expected `Assoc in ap_of_json" 
+          with Not_found -> raise @@ Err  "bssid/ssid not found in AP data")
+    | _ -> raise @@ Err "Expected `Assoc in ap_of_json" 
   in
   match json with
-    | `Assoc [("id", `String id); ("username", `String username); data_json]
-    | `Assoc [("username", `String username); ("id", `String id); data_json] 
+    | `Assoc [("id", `String id); data_json]
       -> (let data = 
             match data_json with
               | ("aps", `List ap_json_l) -> (APS (List.map ap_of_json ap_json_l))
               | ("gps", `Assoc json) -> (GPS (gps_of_json json))
-              | _ -> raise @@ Api_err "Invalid data structure in update json" in
-          {id = id ; user = username ; data = data})
-    | _ -> raise @@ Api_err "Invalid data structure in update json" ;;
+              | _ -> raise @@ Err "Invalid data structure in update json" in
+          {id = id ; data = data})
+    | _ -> raise @@ Err "Invalid data structure in update json" ;;
 
 let verify_request_length len =
   if len > Const.max_upload_len 
-    then raise @@ Api_err "Upload length exceeds maximum"
+    then raise @@ Err "Upload length exceeds maximum"
     else len ;;
 
 let api_of_json = function
   | `Assoc [("Update", json)] -> Update json
   | `Assoc [("Query", json)] -> Query json
   | `Assoc [("Create", json)] -> Create json
-  | `Assoc [(c, _)] -> raise @@ Api_err (sprintf "Unknown API command '%s'" c)
-  |  _ -> raise @@ Api_err "Invalid API format" ;;
+  | `Assoc [(c, _)] -> raise @@ Err (sprintf "Unknown API command '%s'" c)
+  |  _ -> raise @@ Err "Invalid API format" ;;
 
 let query_of_json = function
   | `String "all" -> QueryAll
   | `Assoc [("location", `String place)] -> QueryLocation place
   | `Assoc [("username", `List names)] -> 
       QueryUsers (List.map Yj.Util.to_string names)
-  | _ -> raise @@ Api_err "Invalid query format" ;;
+  | _ -> raise @@ Err "Invalid query format" ;;
 
 let write_update (u : api_update) = 
   let open Location in
@@ -281,26 +276,36 @@ let write_update (u : api_update) =
       | APS a -> Location.title_of_netids 
                   (List.map (fun (a : ap_update_data) -> (a.ssid,a.bssid)) a)
                   Const.location_config.apl in
-
   Sql.update_user u.id location_name time_now;
-  return_unit ;;
+  return u ;;
 
-let write_create (d : api_create) (generated_id : string) = 
-  Sql.create_user generated_id d.user (Unix.time_int64 ());
-  return_unit ;;
+let write_create (generated_id : string) (d : api_create) : api_create = 
+  try
+    (Sql.create_user generated_id d.user (Unix.time_int64 ()); d)
+  with Constraint -> 
+    raise @@ CreateException 
+        (sprintf "CreateException: User '%s' already exists" d.user) ;;
 
 (* Usernames can only contain letters/numbers *)
-let verify_update_data (d : api_update) = 
-  let uname_chars_ok s =
+let verify_create_data (d : api_create) = 
+  let contains_invalid_characters =
     let sane_character = function
       | 'a'..'z' | 'A'..'Z' | '0'..'9' -> true
       | _ -> false in
-    List.for_all sane_character (String.explode s) in
-  let uname_length_ok = 
-    (String.length d.user) <= Const.max_username_length in
-  if (uname_length_ok && (uname_chars_ok d.user))
-  then d
-  else raise @@ Api_err ("Username invalid: " ^ d.user ) ;;
+    List.mem false (List.map sane_character (String.explode d.user)) 
+    in
+  let name_length = (String.length d.user) in
+  let name_too_long = 
+    name_length > Const.max_username_length in
+  let name_too_short =
+    name_length < Const.min_username_length in
+  if name_too_long then
+    raise @@ CreateException ("CreateException: Username too long")
+  else if name_too_short then
+    raise @@ CreateException ("CreateException: Username too short")
+  else if contains_invalid_characters then
+    raise @@ CreateException ("CreateException: Username contains invalid characters") 
+  else d ;;
 
 let response_of_query (ulq_l : Sql.query_db_entry list) =
   let open Sql in
@@ -313,27 +318,22 @@ let response_of_query (ulq_l : Sql.query_db_entry list) =
 
 let create_of_json = function
   | `Assoc [("username", `String user)] -> {user=user} 
-  | _ -> raise @@ Api_err "Invalid Create json structure" ;;
+  | _ -> raise @@ CreateException "CreateException: Invalid Create json structure" ;;
 
 let query_main io query = 
   match query with
-    | QueryUsers names ->
-        Sql.query_by_names names
-    | QueryLocation place -> 
-        Sql.query_by_location place
-    | QueryAll -> 
-        Sql.query_all () ;;
+    | QueryUsers names -> Sql.query_by_names names
+    | QueryLocation place -> Sql.query_by_location place
+    | QueryAll -> Sql.query_all () ;;
   
-let update_main io json = 
-  return @@ verify_update_data json
-  >>= begin fun d -> 
-    return (Sql.user_id_exists d.id)
-    >|= function
-        | true -> (ignore @@ write_update d; string_of_update d)
-        | false -> (sprintf "ID '%s' not found, no update written" d.id)
-  end
-  >>= Lwt_io.printl
-;;
+(*let update_main io update = 
+  return @@ Sql.user_id_exists update.id
+  >|= (function
+        | true ->
+          (ignore @@ write_update update;
+          string_of_update update)
+        | false -> (sprintf "ID '%s' not found, no update written" update.id))
+  >>= Lwt_io.printl ;;*)
 
 let rec create_user_id () = 
   let buf = Bytes.create Const.id_char_length in
@@ -350,7 +350,6 @@ let rec create_user_id () =
   if Sql.user_id_exists id
     then create_user_id ()
     else id ;;
-
 
 let response_of_create response = 
   let make_json inner = 
@@ -370,13 +369,26 @@ let write_json_to_client io (response : Yj.json) =
   let len = Int32.of_int @@ String.length data in
   Lwt_io.BE.write_int32 oc len
   >>= (fun () -> Lwt_io.write oc data)
-  >>= (fun () -> Lwt_io.printf "OUT: %s (%ld)\n" data len)
-;;
+  >>= (fun () -> Lwt_io.printf "OUT: %s (%ld)\n" data len) ;;
+
+let verify_update_data update = 
+  if (Sql.user_id_exists update.id)
+  then update
+  else 
+    (raise @@ UpdateException 
+      (sprintf "UpdateException: ID '%s' does not exist" update.id)) ;;
 
 let api_main io = function
-  | Update j -> 
-      return @@ update_of_json j
-      >>= update_main io
+  | Update j ->
+      (Lwt.catch 
+        (fun () ->
+          return @@ update_of_json j
+          >|= verify_update_data
+          >>= write_update
+          >|= string_of_update)
+      (function
+        UpdateException why -> return why))
+      >>= printl
   | Query j -> 
       return @@ query_of_json j
       >|= query_main io 
@@ -387,13 +399,15 @@ let api_main io = function
       >>= begin fun d -> 
         return @@ create_user_id ()
         >>= begin fun id ->
-          try 
-            ignore @@ write_create d id;
-            return @@ response_of_create (CreateID id)
-            >>= write_json_to_client io
-          with Constraint -> 
-            return @@ response_of_create (CreateError (d.user ^ " already exists"))
-            >>= write_json_to_client io
+          (Lwt.catch
+            (fun () ->
+              return @@ verify_create_data d
+              >|= write_create id
+              >|= (fun d -> response_of_create @@ CreateID id))
+            (function
+               CreateException why -> 
+                 (return @@ response_of_create @@ CreateError why)))
+          >>= write_json_to_client io
         end
       end ;;
 
@@ -435,8 +449,8 @@ let start_server io =
         server_main io
         >>= (fun () -> Lwt_io.close (fst io)))
       (function                    (* Where fatal errors are caught *)
-        | Api_err s -> 
-            log_stop_server ("API Error: " ^ s)
+        | Err s -> 
+            log_stop_server ("Error: " ^ s)
         | Sqlite3.Error msg -> 
             log_stop_server (sprintf "Sqlite3.Error: %s" msg)
         | Yojson.Json_error msg -> 
@@ -449,9 +463,7 @@ let start_server io =
 ;;
 
 let main () =
-  (*let port,buffsz = 9993,(1024*1024*2) in*)
   let listen_addr = Unix.ADDR_INET (Unix.inet_addr_any, Const.port) in
-
   Lwt_io.print @@ Location.string_of_location_conf Const.location_config
   >>= (fun () -> Lwt_io.printf "Started server on port %d\n" Const.port)
   >|= Sql.reset_db
