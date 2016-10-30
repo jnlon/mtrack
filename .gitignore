@@ -1,0 +1,4 @@
+*.sqlite
+*.txt
+_build
+*.native
