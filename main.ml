@@ -24,7 +24,7 @@ type create_data =
   { user : string } ;;
 
 type api = Update of Yj.json | Query of Yj.json | Create of Yj.json ;;
-type query = QueryAll | QueryLocation of string | QueryUser of string ;;
+type query = QueryAll | QueryLocation of string | QueryUsers of string list ;;
 exception Api_err of string ;;
 
 (* Shorthands *)
@@ -34,6 +34,7 @@ let sprintf = Printf.sprintf ;;
 let printfl = Lwt_io.printf ;;
 let printl = Lwt_io.printl ;;
 let async = Lwt.async ;;
+let print_one_off msg = async (fun () -> printl msg) ;;
 
 (* Constants / Configuration paramaters *)
 module Const = struct
@@ -54,7 +55,6 @@ module Const = struct
 end
 
 (* SQL definitions *)
-
 module Sql = struct
 
   exception Bad_conv of string
@@ -74,8 +74,13 @@ module Sql = struct
     "DELETE FROM user_locations;" ;;
   let sql_query_all_stmt = Sqlite3.prepare db 
     "SELECT * FROM user_locations ORDER BY last_update_time DESC;" ;;
-  let sql_query_user_stmt = Sqlite3.prepare db 
-    "SELECT * FROM user_locations WHERE (username = ?001);" ;;
+  let sql_query_users_stmt n = 
+    let identifiers = 
+      String.concat ", " (List.repeat "?" n) in
+    let stmtsrc = 
+      Printf.sprintf 
+        "SELECT * FROM user_locations WHERE username IN (%s);" identifiers in
+    Sqlite3.prepare db stmtsrc ;;
   let sql_query_location_stmt = Sqlite3.prepare db 
     "SELECT * FROM user_locations WHERE (location = ?001) ORDER BY last_update_time DESC;" ;;
   let sql_delete_older_than_stmt time = Sqlite3.prepare db 
@@ -105,7 +110,7 @@ module Sql = struct
     let is_okay r = (r == Sqlite3.Rc.OK) in
     if List.for_all is_okay results 
       then ()
-      else raise @@ Sqlite3.Error ("Error binding variables to SQL statements") ;;
+      else raise @@ Sqlite3.Error "Error binding variables to SQL statements" ;;
 
   let reset_db () = 
     reset_stmt sql_reset_db_stmt;
@@ -127,7 +132,7 @@ module Sql = struct
       location : string ;
       last_update_time : int64 } ;;
 
-  let query_users bindings stmt : (query_db_entry list) = 
+  let query_db bindings stmt : (query_db_entry list) = 
     let db_entry_of_row row = 
       { username = string_of_db_text @@ Array.get row 1 ;
         location = string_of_db_text @@ Array.get row 2 ;
@@ -170,14 +175,16 @@ module Sql = struct
     found_an_id 
   ;;
 
-  let query_by_name uname =
-    query_users [(1, Sqlite3.Data.TEXT uname)] sql_query_user_stmt ;;
+  let query_by_names names =
+    let stmt = sql_query_users_stmt (List.length names) in
+    let bindings = List.mapi (fun i name -> ((i+1), Sqlite3.Data.TEXT name)) names in
+    query_db bindings stmt  ;;
 
   let query_by_location place =
-    query_users [(1, Sqlite3.Data.TEXT place)] sql_query_location_stmt ;;
+    query_db [(1, Sqlite3.Data.TEXT place)] sql_query_location_stmt ;;
 
   let query_all () =
-    query_users [] sql_query_all_stmt ;;
+    query_db [] sql_query_all_stmt ;;
 
   let delete_older_than time = 
     sqlite_bind_exec [] (sql_delete_older_than_stmt time) ;;
@@ -200,9 +207,9 @@ let string_of_aps aps =
 let string_of_update r = 
   match r.data with
     | GPS g -> 
-        sprintf "GPS Update from '%s':\n  (%f,%f)" r.id g.lat g.lon
+        sprintf "GPS Update from id='%s',user='%s':\n  (%f,%f)" r.id r.user g.lat g.lon
     | APS a ->
-        sprintf "APS Update from '%s':\n%s" r.id (string_of_aps a) ;;
+        sprintf "APS Update from id='%s',user='%s':\n%s" r.id r.user (string_of_aps a) ;;
 
 let update_of_json (json : Yj.json) : api_update = 
   let to_string = Yj.Util.to_string in
@@ -245,7 +252,8 @@ let api_of_json = function
 let query_of_json = function
   | `String "all" -> QueryAll
   | `Assoc [("location", `String place)] -> QueryLocation place
-  | `Assoc [("username", `String name)] -> QueryUser name
+  | `Assoc [("username", `List names)] -> 
+      QueryUsers (List.map Yj.Util.to_string names)
   | _ -> raise @@ Api_err "Invalid query format" ;;
 
 let write_update_to_db (u : api_update) = 
@@ -288,8 +296,8 @@ let create_of_json = function
   | _ -> raise @@ Api_err "Invalid Create json structure" ;;
 
 let query_main io = function
-  | QueryUser name -> 
-      return @@ Sql.query_by_name name
+  | QueryUsers names -> 
+      return @@ Sql.query_by_names names
       >|= json_of_db_query
       >|= Yojson.Safe.to_string
       >>= Lwt_io.printl
@@ -302,7 +310,7 @@ let query_main io = function
       return @@ Sql.query_all ()
       >|= json_of_db_query
       >|= Yojson.Safe.to_string
-      >>= Lwt_io.printl
+      >>= Lwt_io.printl ;;
 
 let update_main io json = 
   return @@ verify_update_data json
