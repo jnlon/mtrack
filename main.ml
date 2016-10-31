@@ -346,7 +346,8 @@ let write_json_to_client io (response : Yj.json) =
   let len = Int32.of_int @@ String.length data in
   Lwt_io.BE.write_int32 oc len
   >>= (fun () -> Lwt_io.write oc data)
-  >>= (fun () -> Lwt_io.printf "OUT: %s (%ld)\n" data len) ;;
+  >>= (fun () -> Lwt_io.printf "OUT: %s (%ld)\n" data len)
+  >>= (fun () -> Lwt_io.flush oc) ;;
 
 let verify_update_data update = 
   if (Sql.user_id_exists update.id)
@@ -413,12 +414,14 @@ let start_server io =
   let log_stop_server msg = 
     let in_chan,out_chan = io in
     Lwt_io.printl msg
+    >>= (fun () -> Lwt_io.close out_chan)
     >>= (fun () -> Lwt_io.close in_chan) in
   let start_server () = 
     Lwt.catch 
       (fun () -> 
         server_main io
-        >>= (fun () -> Lwt_io.close (fst io)))
+        >>= (fun () -> Lwt_io.close (fst io))
+        >>= (fun () -> Lwt_io.close (snd io)))
       (function                    (* Where fatal errors are caught *)
         | Err s -> 
             log_stop_server ("Error: " ^ s)
