@@ -70,7 +70,7 @@ module Sql = struct
 
   let int64_of_db_int = 
     function SD.INT i64 -> i64 | SD.NULL -> 0L | _ -> raise @@ Bad_conv "int64" ;;
-  let float_of_db_float = 
+  let string_of_db_text = 
     function SD.TEXT txt -> txt | SD.NULL -> "" | _ -> raise @@ Bad_conv "text" ;;
 
   let db =
