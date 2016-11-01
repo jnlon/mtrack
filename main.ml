@@ -15,20 +15,30 @@ type update_data =
     GPS of gps_update_data 
   | APS of ap_update_data list ;;
 
+type query_special = All ;;
+type query = 
+    Users of string list
+  | Location of string
+  | Special of query_special ;;
+
 type api_update = 
   { id : string ;
     data : update_data } ;;
+
+type api_query = 
+  { id: string;
+    t : query }
 
 type api_create =
   { user : string } ;;
 
 type api = Update of Yj.json | Query of Yj.json | Create of Yj.json ;;
-type query = QueryAll | QueryLocation of string | QueryUsers of string list ;;
 type create_response = CreateID of string | CreateError of string ;;
-exception CreateException of string ;;
-exception UpdateException of string ;;
+type create_status = ValidCreate of api_create | InvalidCreate of string ;;
+type query_status = ValidQuery of api_query | InvalidQuery ;;
+type username_status = ValidName | InvalidName of string ;;
 exception Err of string ;;
-exception Constraint ;;
+exception SqliteConstraint ;;
 
 (* Shorthands *)
 let return_unit = Lwt.return_unit ;;
@@ -45,18 +55,17 @@ module Const = struct
   let max_username_length = 32 ;;
   let min_username_length = 8 ;;
   let db_max_query_rows = 50 ;;
-  let query_all_enabled = true ;;
+  let query_special_enabled = true ;;
   let db_file_path = "db/sampledbV3.sqlite" ;;
-  let sql_table_name = "user_locations" ;;
   let sleepy_loop_delay = 300.0 ;;
   let id_char_length = 8 ;;
   let stale_db_entry_time = Int64.of_int ((60*60*24)*8) ;; (* in seconds *) 
-  let block_uncreated_ids = false ;;    (* clients must have a user id to make requests *)
-  let location_config = 
-    Location.config_of_file "json/locations.json" ;;
   let backlog = 50 ;;
   let buffer_size = 20480 ;;
   let port = 9993 ;;
+  let location_config = 
+    Location.config_of_file "json/locations.json" ;;
+  let default_query_response = (`Assoc [("QueryResponse", `List [])]) ;;
 end
 
 (* SQL definitions *)
@@ -80,6 +89,8 @@ module Sql = struct
   let sql_create_user_stmt = Sqlite3.prepare db 
     "INSERT INTO user_locations (userid,username,location,last_update_time,creation_time)
      VALUES (?001, ?002, '', ?003, ?004);" ;;
+  let sql_query_username_stmt = Sqlite3.prepare db
+    "SELECT * FROM user_locations WHERE username=?001"
   let sql_query_id_stmt = Sqlite3.prepare db
     "SELECT * FROM user_locations WHERE userid=?001"
   let sql_reset_db_stmt = Sqlite3.prepare db 
@@ -111,7 +122,7 @@ module Sql = struct
     let rec walk_sqlite = function
           | BUSY | OK -> walk_sqlite @@ step ()
           | DONE -> ()
-          | CONSTRAINT -> raise Constraint
+          | CONSTRAINT -> raise SqliteConstraint
           | state -> 
               raise @@ Sqlite3.Error (sprintf "Error in exec_sql_stmt: %s" (to_string state))
     in
@@ -169,6 +180,10 @@ module Sql = struct
     let query = query_db [1, (SD.TEXT id)] sql_query_id_stmt in
     (List.length query) > 0 ;;
 
+  let user_name_exists name =
+    let query = query_db [1, (SD.TEXT name)] sql_query_username_stmt in
+    (List.length query) > 0 ;;
+
   let query_by_names names =
     let stmt = sql_query_users_stmt (List.length names) in
     let bindings = List.mapi (fun i name -> ((i+1), SD.TEXT name)) names in
@@ -198,7 +213,7 @@ module Sql = struct
       (4, (SD.INT time))] in
     try
       sqlite_bind_exec bindings sql_create_user_stmt 
-    with Constraint -> raise Constraint ;;
+    with SqliteConstraint -> raise @@ Err "Contraint in create_user" ;;
     
 end
 
@@ -252,11 +267,14 @@ let api_of_json = function
   |  _ -> raise @@ Err "Invalid API format" ;;
 
 let query_of_json = function
-  | `String "all" when Const.query_all_enabled -> QueryAll
-  | `Assoc [("location", `String place)] -> QueryLocation place
-  | `Assoc [("username", `List names)] -> 
-      QueryUsers (List.map Yj.Util.to_string names)
-  | _ -> raise @@ Err "Invalid query format" ;;
+  | `Assoc [("id", `String id ); ("location", `String place)] -> 
+      ValidQuery { id = id ; t = Location place }
+  | `Assoc [("id", `String id ); ("users", `List names)] -> 
+      ValidQuery { id = id ; t = Users (List.map Yj.Util.to_string names)}
+  | `Assoc [("id", `String id ); ("special", `String "all")] 
+     when Const.query_special_enabled -> 
+      ValidQuery { id = id ; t = Special All }
+  | _ -> InvalidQuery ;;
 
 let write_update (u : api_update) = 
   let open Location in
@@ -270,33 +288,39 @@ let write_update (u : api_update) =
   Sql.update_user u.id location_name time_now;
   return u ;;
 
-let write_create (d : api_create) (id : string) : string = 
-  try
-    (Sql.create_user id d.user (Unix.time_int64 ()); id)
-  with Constraint -> 
-    raise @@ CreateException 
-        (sprintf "CreateException: User '%s' already exists" d.user) ;;
+let write_create (d : api_create) (id : string) = 
+  ignore @@ Sql.create_user id d.user (Unix.time_int64 ()) ;; 
 
-(* Usernames can only contain letters/numbers *)
-let verify_create_data (d : api_create) = 
+let validate_username name =
   let contains_invalid_characters =
     let sane_character = function
       | 'a'..'z' | 'A'..'Z' | '0'..'9' -> true
       | _ -> false in
-    List.mem false (List.map sane_character (String.explode d.user)) 
+    List.mem false (List.map sane_character (String.explode name)) 
   in
-  let name_length = (String.length d.user) in
+  let name_length = (String.length name) in
   let name_too_long = name_length > Const.max_username_length in
   let name_too_short = name_length < Const.min_username_length in
   if name_too_long then
-    raise @@ CreateException ("CreateException: Username too long")
+    InvalidName "Username too long"
   else if name_too_short then
-    raise @@ CreateException ("CreateException: Username too short")
+    InvalidName "Username too short"
   else if contains_invalid_characters then
-    raise @@ CreateException ("CreateException: Username contains invalid characters") 
-  else d ;;
+    InvalidName "Username contains invalid characters"
+  else if (Sql.user_name_exists name) then 
+    InvalidName "Username already exists"
+  else ValidName ;;
 
-let response_of_query (dbq_l : Sql.query_db_entry list) =
+
+(* Usernames can only contain letters/numbers *)
+let verify_create_data = function
+  | ValidCreate d -> 
+      (match (validate_username d.user) with
+        | InvalidName why -> InvalidCreate why
+        | ValidName -> ValidCreate d)
+  | otherwise -> otherwise ;;
+
+let response_json_of_query (dbq_l : Sql.query_db_entry list) =
   let open Sql in
   let json_of_query q = 
     `Assoc [("username", `String q.username);
@@ -306,13 +330,14 @@ let response_of_query (dbq_l : Sql.query_db_entry list) =
   `Assoc [("QueryResponse", (`List (List.map json_of_query dbq_l)))] ;;
 
 let create_of_json = function
-  | `Assoc [("username", `String user)] -> {user=user} 
-  | _ -> raise @@ CreateException "CreateException: Invalid Create json structure" ;;
+  | `Assoc [("user", `String user)] -> ValidCreate {user=user} 
+  | _ -> InvalidCreate "Invalid Create request structure" ;;
 
-let query_main io = function
-  | QueryUsers names -> Sql.query_by_names names
-  | QueryLocation place -> Sql.query_by_location place
-  | QueryAll -> Sql.query_all () ;;
+let query_main io q = 
+  match q.t with
+    | Users users -> Sql.query_by_names users
+    | Location place -> Sql.query_by_location place
+    | Special All -> Sql.query_all () ;;
   
 let rec create_user_id () = 
   let buf = Bytes.create Const.id_char_length in
@@ -349,41 +374,42 @@ let write_json_to_client io (response : Yj.json) =
   >>= (fun () -> Lwt_io.printf "OUT: %s (%ld)\n" data len)
   >>= (fun () -> Lwt_io.flush oc) ;;
 
-let verify_update_data update = 
-  if (Sql.user_id_exists update.id)
-  then update
-  else 
-    (raise @@ UpdateException 
-      (sprintf "UpdateException: ID '%s' does not exist" update.id)) ;;
+let json_id_exists jsonl = 
+  let id = Yj.Util.to_string @@ List.assoc "id" jsonl in
+  Sql.user_id_exists id ;;
+
+let verify_query = function 
+  | ValidQuery q -> 
+      if Sql.user_id_exists q.id 
+      then ValidQuery q 
+      else InvalidQuery
+  | _ -> InvalidQuery ;;
 
 let api_main io = function
   | Update j ->
-      (Lwt.catch 
-        (fun () ->
-          return @@ update_of_json j
-          >|= verify_update_data
-          >>= write_update
-          >|= string_of_update)
-      (function
-        UpdateException why -> return why))
+      return @@ update_of_json j
+      >>= write_update
+      >|= string_of_update
       >>= printl
   | Query j -> 
-      return @@ query_of_json j
-      >|= query_main io 
-      >|= response_of_query
+      return @@ query_of_json j 
+      >|= verify_query
+      >>= (function
+        | InvalidQuery -> return @@ Const.default_query_response
+        | ValidQuery q -> 
+            (return @@ query_main io q
+            >|= response_json_of_query))
       >>= write_json_to_client io
   | Create j -> 
-      (Lwt.catch
-        (fun () ->
-          return @@ create_of_json j 
-          >|= verify_create_data 
-          >>= (fun d -> 
-            return @@ create_user_id ()
-            >|= write_create d
-            >|= (fun id -> response_of_create @@ CreateID id)))
-        (function
-           CreateException why -> 
-             (return @@ response_of_create @@ CreateError why)))
+      return @@ create_of_json j 
+      >|= verify_create_data
+      >>= (function
+        | InvalidCreate why -> return @@ CreateError why
+        | ValidCreate d -> 
+            (let id = create_user_id () in
+            return @@ write_create d id
+            >|= (fun () -> CreateID id)))
+      >|= response_of_create
       >>= write_json_to_client io ;;
 
 let server_main io =
