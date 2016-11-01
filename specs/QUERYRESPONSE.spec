@@ -1,11 +1,11 @@
 # Returned to the client in response to Query
 { "QueryResponse": 
   [
-    {"username": "sample", "location": "someplace", "lastupdate": 1232},
-    {"username": "me", "location": "home", "lastupdate": 1233},
-    {"username": "admin", "location": "nowhere", "lastupdate": 12123},
-    {"username": "root", "location": "/var/empty", "lastupdate": 12123},
-    {"username": "wheel", "location": "no", "lastupdate": 12123}
+    {"user": "sample", "location": "someplace", "lastupdate": 1232},
+    {"user": "me", "location": "home", "lastupdate": 1233},
+    {"user": "admin", "location": "nowhere", "lastupdate": 12123},
+    {"user": "root", "location": "/var/empty", "lastupdate": 12123},
+    {"user": "wheel", "location": "no", "lastupdate": 12123}
   ]
 }
 
